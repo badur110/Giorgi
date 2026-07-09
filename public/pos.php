@@ -64,6 +64,20 @@ function order_items(int $orderId): array
     $stmt->execute([$orderId]);
     return $stmt->fetchAll();
 }
+function fetch_table(int $tableId): ?array
+{
+    $stmt = db()->prepare('SELECT * FROM restaurant_tables WHERE id=?');
+    $stmt->execute([$tableId]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+function fetch_order(int $orderId): ?array
+{
+    $stmt = db()->prepare('SELECT * FROM orders WHERE id=?');
+    $stmt->execute([$orderId]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
 function receipt_header(string $title, array $table): array
 {
     $lines = [];
@@ -76,17 +90,6 @@ function receipt_header(string $title, array $table): array
     $lines[] = 'დრო: ' . date('Y-m-d H:i');
     $lines[] = str_repeat('-', 32);
     return $lines;
-}
-function print_to_lan_printer(string $ip, int $port, string $text): bool
-{
-    if (envv('PRINTING_ENABLED','false') !== 'true') return true;
-    $fp = @fsockopen($ip, $port, $errno, $errstr, 3);
-    if (!$fp) return false;
-    fwrite($fp, "\x1B\x40");
-    fwrite($fp, $text . "\n\n\n");
-    fwrite($fp, "\x1D\x56\x01");
-    fclose($fp);
-    return true;
 }
 function build_kitchen_ticket(array $table, array $items): string
 {
@@ -128,6 +131,21 @@ function build_final_receipt(array $table, array $order, array $items): string
     }
     $lines[] = envv('RECEIPT_THANK_YOU','გმადლობთ სტუმრობისთვის!');
     return implode("\n", $lines);
+}
+function receipt_box(string $id, string $title, string $text): string
+{
+    return '<div class="receipt-preview"><h2>'.h($title).'</h2><pre id="'.h($id).'">'.h($text).'</pre><button class="primary" onclick="printReceipt(\''.h($id).'\')">ბეჭდვა</button></div>';
+}
+function print_script(): string
+{
+    return '<script>
+function printReceipt(id){
+  const content = document.getElementById(id).innerText;
+  const w = window.open("", "_blank", "width=420,height=700");
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Print</title><style>@page{size:80mm auto;margin:4mm}body{font-family:Arial,sans-serif;font-size:13px;white-space:pre-wrap;color:#000}pre{white-space:pre-wrap;margin:0}</style></head><body><pre>${content.replace(/</g,"&lt;")}</pre><script>window.onload=function(){window.print();}</`+`script></body></html>`);
+  w.document.close();
+}
+</script>';
 }
 function layout_header(string $title): void
 {
@@ -181,16 +199,12 @@ if ($action === 'send_order') {
     $tableId = (int)$_POST['table_id'];
     $order = current_open_order($tableId);
     if (!$order) redirect_to('table', ['id'=>$tableId]);
-    $stmt = db()->prepare('SELECT * FROM restaurant_tables WHERE id=?'); $stmt->execute([$tableId]); $table = $stmt->fetch();
     $stmt = db()->prepare('SELECT * FROM order_items WHERE order_id=? AND is_cancelled=0 AND printed_at IS NULL ORDER BY id ASC');
     $stmt->execute([$order['id']]); $items = $stmt->fetchAll();
     if (!$items) { $_SESSION['flash'] = 'ახალი დასაბეჭდი პროდუქტი არ არის'; redirect_to('table', ['id'=>$tableId]); }
-    $cashierOk = print_to_lan_printer(envv('CASHIER_PRINTER_IP',''), (int)envv('PRINTER_PORT',9100), build_cashier_ticket($table,$items));
-    $kitchenOk = print_to_lan_printer(envv('KITCHEN_PRINTER_IP',''), (int)envv('PRINTER_PORT',9100), build_kitchen_ticket($table,$items));
     $ids = array_column($items, 'id');
     db()->prepare('UPDATE order_items SET printed_at=NOW() WHERE id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')')->execute($ids);
-    $_SESSION['flash'] = ($cashierOk && $kitchenOk) ? 'შეკვეთა დაიბეჭდა' : 'შეკვეთა შეინახა, მაგრამ პრინტერთან კავშირი გადასამოწმებელია';
-    redirect_to('table', ['id'=>$tableId]);
+    redirect_to('print_order', ['order_id'=>(int)$order['id'], 'table_id'=>$tableId, 'item_ids'=>implode(',', $ids)]);
 }
 if ($action === 'cancel_item') {
     $tableId = (int)$_POST['table_id'];
@@ -205,10 +219,7 @@ if ($action === 'close_order') {
     $card = $paymentType === 'mixed' ? (float)($_POST['card_amount'] ?? 0) : ($paymentType === 'card' ? $total : 0);
     db()->prepare('UPDATE orders SET status="closed", total=?, payment_type=?, cash_amount=?, card_amount=?, closed_at=NOW() WHERE id=?')->execute([$total,$paymentType,$cash,$card,$order['id']]);
     db()->prepare('UPDATE restaurant_tables SET status="free" WHERE id=?')->execute([$tableId]);
-    $stmt = db()->prepare('SELECT * FROM restaurant_tables WHERE id=?'); $stmt->execute([$tableId]); $table = $stmt->fetch();
-    $stmt = db()->prepare('SELECT * FROM orders WHERE id=?'); $stmt->execute([$order['id']]); $closedOrder = $stmt->fetch();
-    print_to_lan_printer(envv('CASHIER_PRINTER_IP',''), (int)envv('PRINTER_PORT',9100), build_final_receipt($table, $closedOrder, order_items((int)$order['id'])));
-    $_SESSION['flash'] = 'მაგიდა დაიხურა'; redirect_to('tables');
+    redirect_to('print_final', ['order_id'=>(int)$order['id']]);
 }
 if ($action === 'save_product') {
     require_admin();
@@ -232,7 +243,7 @@ if ($page === 'tables') {
     echo '</div>'; layout_footer(); exit;
 }
 if ($page === 'table') {
-    $tableId = (int)($_GET['id'] ?? 0); $stmt = db()->prepare('SELECT * FROM restaurant_tables WHERE id=?'); $stmt->execute([$tableId]); $table = $stmt->fetch(); if (!$table) redirect_to('tables');
+    $tableId = (int)($_GET['id'] ?? 0); $table = fetch_table($tableId); if (!$table) redirect_to('tables');
     $order = current_open_order($tableId); $items = $order ? order_items((int)$order['id']) : []; $total = $order ? order_total((int)$order['id']) : 0;
     $products = db()->query('SELECT p.*, c.name category_name FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.is_active=1 ORDER BY c.name, p.name')->fetchAll();
     layout_header($table['name']);
@@ -241,9 +252,31 @@ if ($page === 'table') {
     foreach ($products as $product) { if ($currentCat !== $product['category_name']) { $currentCat = $product['category_name']; echo '<h3 class="cat">'.h($currentCat ?: 'სხვა').'</h3>'; } echo '<form class="product-row" method="post"><input type="hidden" name="action" value="add_item"><input type="hidden" name="table_id" value="'.$tableId.'"><input type="hidden" name="product_id" value="'.(int)$product['id'].'"><div><strong>'.h($product['name']).'</strong><small>'.money($product['price']).'</small></div><input name="quantity" type="number" min="1" value="1"><input name="comment" placeholder="კომენტარი"><button>დამატება</button></form>'; }
     echo '</div><div class="card"><h2>მიმდინარე შეკვეთა</h2>'; if (!$items) echo '<p>შეკვეთა ჯერ ცარიელია.</p>';
     foreach ($items as $item) { $cancelled = (int)$item['is_cancelled'] === 1; echo '<div class="item '.($cancelled?'cancelled':'').'"><div><strong>'.h($item['quantity']).' x '.h($item['product_name']).'</strong><br><small>'.money($item['price']).' / ჯამი: '.money($item['price']*$item['quantity']).'</small>'; if ($item['comment']) echo '<br><em>'.h($item['comment']).'</em>'; if ($item['printed_at']) echo '<br><small>დაბეჭდილია</small>'; if ($cancelled) echo '<br><small>გაუქმებულია: '.h($item['cancel_reason']).'</small>'; echo '</div>'; if (!$cancelled) echo '<form method="post" class="cancel-form"><input type="hidden" name="action" value="cancel_item"><input type="hidden" name="table_id" value="'.$tableId.'"><input type="hidden" name="item_id" value="'.(int)$item['id'].'"><input type="password" name="cancel_password" placeholder="პაროლი"><input name="cancel_reason" placeholder="მიზეზი"><button class="danger">გაუქმება</button></form>'; echo '</div>'; }
-    echo '<div class="actions"><form method="post"><input type="hidden" name="action" value="send_order"><input type="hidden" name="table_id" value="'.$tableId.'"><button class="primary">შეკვეთის დაბეჭდვა</button></form></div>';
+    echo '<div class="actions"><form method="post"><input type="hidden" name="action" value="send_order"><input type="hidden" name="table_id" value="'.$tableId.'"><button class="primary">შეკვეთის გაგზავნა / ჩეკების ნახვა</button></form></div>';
     if ($order) echo '<hr><h2>მაგიდის დახურვა</h2><form method="post" class="close-form"><input type="hidden" name="action" value="close_order"><input type="hidden" name="table_id" value="'.$tableId.'"><label>გადახდის ტიპი<select name="payment_type" onchange="document.getElementById(\'mixed_fields\').style.display=this.value===\'mixed\'?\'grid\':\'none\'"><option value="cash">ნაღდი</option><option value="card">ბარათი</option><option value="mixed">შერეული</option></select></label><div id="mixed_fields" class="mixed"><label>ნაღდი<input name="cash_amount" type="number" step="0.01"></label><label>ბარათი<input name="card_amount" type="number" step="0.01"></label></div><button class="success">საბოლოო ანგარიში და დახურვა</button></form>';
     echo '</div></section>'; layout_footer(); exit;
+}
+if ($page === 'print_order') {
+    $orderId = (int)($_GET['order_id'] ?? 0); $tableId = (int)($_GET['table_id'] ?? 0); $table = fetch_table($tableId); $order = fetch_order($orderId);
+    $ids = array_filter(array_map('intval', explode(',', $_GET['item_ids'] ?? '')));
+    if (!$table || !$order || !$ids) redirect_to('tables');
+    $stmt = db()->prepare('SELECT * FROM order_items WHERE order_id=? AND id IN (' . implode(',', array_fill(0, count($ids), '?')) . ') ORDER BY id ASC');
+    $stmt->execute(array_merge([$orderId], $ids)); $items = $stmt->fetchAll();
+    layout_header('ბეჭდვა');
+    echo '<h1>შეკვეთის ბეჭდვა</h1><p>ჯერ დაბეჭდე სალაროს ჩეკი, მერე სამზარეულოს ჩეკი. თითოეულზე აირჩიე შესაბამისი პრინტერი.</p><section class="print-layout">';
+    echo receipt_box('cashier_receipt', 'სალარო / ბარი', build_cashier_ticket($table, $items));
+    echo receipt_box('kitchen_receipt', 'სამზარეულო — ფასების გარეშე', build_kitchen_ticket($table, $items));
+    echo '</section><p><a class="back-link" href="?page=table&id='.$tableId.'">მაგიდაზე დაბრუნება</a></p>'.print_script();
+    layout_footer(); exit;
+}
+if ($page === 'print_final') {
+    $orderId = (int)($_GET['order_id'] ?? 0); $order = fetch_order($orderId); if (!$order) redirect_to('tables');
+    $table = fetch_table((int)$order['table_id']); $items = order_items($orderId); if (!$table) redirect_to('tables');
+    layout_header('საბოლოო ანგარიში');
+    echo '<h1>საბოლოო ანგარიში</h1><section class="print-layout single">';
+    echo receipt_box('final_receipt', 'სალაროს საბოლოო ანგარიში', build_final_receipt($table, $order, $items));
+    echo '</section><p><a class="back-link" href="?page=tables">მაგიდებზე დაბრუნება</a></p>'.print_script();
+    layout_footer(); exit;
 }
 if ($page === 'products') {
     require_admin(); $edit = null;
