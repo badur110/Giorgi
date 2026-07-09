@@ -1,5 +1,8 @@
 CREATE DATABASE IF NOT EXISTS nineteen_pleats CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE nineteen_pleats;
+SET NAMES utf8mb4;
+SET CHARACTER SET utf8mb4;
+SET collation_connection = 'utf8mb4_unicode_ci';
 
 CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
